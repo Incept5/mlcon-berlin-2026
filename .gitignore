@@ -7,3 +7,4 @@ venv/
 TEACHER_NOTES.md
 .idea/
 /day-1/embeddings.pkl
+/day-2/chroma_db/
