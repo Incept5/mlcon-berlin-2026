@@ -1,4 +1,5 @@
 from typing import List, Tuple
+import json
 import numpy as np
 import requests
 from dataclasses import dataclass
@@ -21,6 +22,53 @@ class OllamaClient:
     def __init__(self):
         self.base_url = "http://localhost:11434/api"
 
+    def ensure_models(self, models: List[str]) -> None:
+        """Pull any required models that aren't installed yet, showing download
+        progress. The models here total a few GB; doing this up front (with no
+        request timeout) avoids the first embed/chat call silently timing out
+        while Ollama is still downloading the weights."""
+        try:
+            tags = requests.get(f"{self.base_url}/tags", timeout=10).json()
+        except requests.RequestException as e:
+            raise RuntimeError(
+                f"Could not reach Ollama at {self.base_url} - is it running? "
+                "Start it with 'ollama serve'."
+            ) from e
+
+        installed = {m["name"] for m in tags.get("models", [])}
+
+        def is_installed(model: str) -> bool:
+            if model in installed:
+                return True
+            # a bare name (no ':tag') matches its ':latest' pull
+            return ":" not in model and f"{model}:latest" in installed
+
+        for model in models:
+            if is_installed(model):
+                continue
+            print(f"Model '{model}' not found locally - pulling it now "
+                  "(first run only, this can take a few minutes)...")
+            self._pull(model)
+
+    def _pull(self, model: str) -> None:
+        with requests.post(f"{self.base_url}/pull", json={"model": model},
+                           stream=True, timeout=None) as response:
+            response.raise_for_status()
+            last_status = ""
+            for line in response.iter_lines():
+                if not line:
+                    continue
+                update = json.loads(line)
+                status = update.get("status", "")
+                total, completed = update.get("total"), update.get("completed", 0)
+                if total:
+                    print(f"\r  {status}: {completed / total * 100:5.1f}%",
+                          end="", flush=True)
+                elif status != last_status:
+                    print(f"\r  {status}", end="", flush=True)
+                    last_status = status
+            print(f"\r  pulled '{model}'" + " " * 20)
+
     def get_embedding(self, text: str, task_type: str = "document") -> np.ndarray:
         # EmbeddingGemma uses task-specific prompts for document vs query
         if task_type == "query":
@@ -29,7 +77,8 @@ class OllamaClient:
             formatted_text = f"title: none | text: {text}"
 
         data = {"model": EMBEDDING_MODEL, "prompt": formatted_text}
-        response = requests.post(f"{self.base_url}/embeddings", json=data, timeout=30)
+        # generous timeout: the first call also loads the model into memory
+        response = requests.post(f"{self.base_url}/embeddings", json=data, timeout=120)
         response.raise_for_status()
         return np.array(response.json()["embedding"])
 
@@ -192,6 +241,7 @@ class GrimmRAG:
         return text.strip()
 
     def _load_document(self):
+        self.ollama.ensure_models([EMBEDDING_MODEL, LLM_MODEL])
         print(f"Loading {self.file_path.name} - {self.chunker.get_config_info()}")
 
         try:
